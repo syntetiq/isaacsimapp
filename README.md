@@ -37,6 +37,35 @@ replicant/
 └── README.md
 ```
 
+## Where this fits — the SyntetiQ stack
+
+`isaacsimapp` is one of three components of the SyntetiQ AI-driven
+robotics stack delivered for the [euROBIN](https://www.eurobin-project.eu/)
+3rd Open Call Technology Exchange Programme (Sub-Grant Agreement
+`euROBIN_3OC_8`, Horizon Europe Grant `101070596`).
+
+```
+   USD scene  ┌──────────────────┐    Pascal VOC / YOLO ZIP
+       │      │  isaacsimapp     │      ┌──────────┐
+       └──────▶  (this repo)     ├─────▶│ syntetiq │
+              │                  │      │   daas   │
+              │  • USD loader    │      │  portal  │
+              │  • Replicator    │      └──────────┘
+              │    BasicWriter   │           ▲
+              │  • augmentations │           │ ingests RoboLab episodes
+              │  • VOC / YOLO    │           │
+              │    converter     │      ┌──────────┐
+              │  • GCS upload    │      │  robolab │
+              └──────────────────┘      └──────────┘
+                                          PAL TIAGo data collection
+```
+
+| Repository | Role |
+|---|---|
+| [`syntetiq/syntetiqdaas`](https://github.com/syntetiq/syntetiqdaas) | DaaS portal — calls **this** service from `OmniverseBundle` |
+| [`syntetiq/isaacsimapp`](https://github.com/syntetiq/isaacsimapp) | Synthetic-data generator — this repo |
+| [`syntetiq/robolab`](https://github.com/syntetiq/robolab) | Robotic data-collection platform (PAL TIAGo, MoveIt 2, VR teleop) |
+
 ## Requirements
 
 - NVIDIA Isaac Sim (or compatible Kit) with the Replicator extension (`omni.replicator.core`) and a configured conda environment. See NVIDIA's official documentation for installation.
@@ -127,6 +156,52 @@ After a successful upload the service can `POST` to `CALLBACK_URL` with:
 ```
 
 To trigger a callback, include a `hash_request` field in your `/load-stage` request body. See [examples/callback_example.py](examples/callback_example.py) and [examples/gcs_upload_example.py](examples/gcs_upload_example.py).
+
+## Reproducing without Isaac Sim — API surface walkthrough
+
+The FastAPI server itself does **not** import `isaacsim`; it shells
+out to a separate Isaac Sim Python interpreter via `subprocess`. That
+means a reviewer can spin up the REST surface in any plain Python 3
+environment to validate the request schema, OpenAPI docs and
+authentication path without first installing Isaac Sim. **Real
+generation still requires Isaac Sim** — this mode is intended only
+for code review, schema validation, and CI.
+
+```bash
+git clone https://github.com/syntetiq/isaacsimapp.git
+cd isaacsimapp
+python3 -m venv .venv && source .venv/bin/activate
+pip install fastapi uvicorn pydantic python-dotenv requests
+cp .env.example .env
+
+# Start the API surface (no Isaac Sim required for this step)
+uvicorn scripts.dataset_server:app --host 127.0.0.1 --port 8000
+```
+
+In another terminal:
+
+```bash
+# 1. Health check (returns 200)
+curl -i http://127.0.0.1:8000/healthz
+
+# 2. Inspect the auto-generated OpenAPI spec
+curl -s http://127.0.0.1:8000/openapi.json | python3 -m json.tool | head -40
+
+# 3. Browse interactive docs in a browser
+open http://127.0.0.1:8000/docs
+
+# 4. Validate the LoadStageRequest schema with a deliberately
+#    malformed payload — should return HTTP 422 with a clear error
+curl -i -X POST http://127.0.0.1:8000/load-stage \
+    -H 'Content-Type: application/json' \
+    -d '{"frames": -1}'
+```
+
+A real `POST /load-stage` with a valid payload returns **HTTP 200**
+on a machine with Isaac Sim installed; without Isaac Sim it returns
+the same HTTP 200 but the background subprocess will fail when it
+tries to launch the simulator — i.e. you can verify the request path
+end-to-end up to the simulator hand-off.
 
 ## Usage — REST server
 
@@ -322,6 +397,42 @@ Each entry in the `augmentation` array (or each `--aug-*` flag) selects exactly 
 | `sobel`            | `frequency`                                                                                         |
 | `speckle_noise`    | `sigma` (>=0), `seed` (>=0), `frequency`                                                            |
 
+## Integration with SyntetiQ DaaS
+
+The production [DaaS portal](https://github.com/syntetiq/syntetiqdaas)
+calls this service from its `OmniverseBundle` to generate synthetic
+training data on demand. The integration contract:
+
+1. The DaaS portal reads the configured `isaacsimapp` host (typically
+   set in the bundle's parameters / environment) and POSTs a
+   `LoadStageRequest` to `/load-stage` with a `hash_request` field so
+   it can match the asynchronous callback later.
+2. `isaacsimapp` returns **200 OK** immediately and runs the
+   generation in the background. While running, any further `POST
+   /load-stage` returns **409 Conflict** (single-job locking).
+3. On success, `isaacsimapp` zips the dataset and uploads it to GCS
+   under `{GCS_BUCKET_DIRECTORY}/import_tmp/<hash>.zip`, then POSTs
+   `{"hash": "<request_hash>", "fileName": "<zip_filename>"}` to
+   `CALLBACK_URL` — by default the DaaS portal's import endpoint.
+4. The DaaS portal verifies the hash, downloads the zip from GCS, and
+   creates a `DataSet` whose `DataSetItem` rows reference the
+   per-frame JPEGs and Pascal-VOC bounding-box XMLs.
+
+Sample call from the DaaS bundle (curl-equivalent):
+
+```bash
+curl -X POST http://<isaacsimapp-host>:8000/load-stage \
+  -H 'Content-Type: application/json' \
+  -d @sample_request.json
+# 200 OK
+# {"status": "accepted", "output_dir": "...", "command": [...]}
+```
+
+See [examples/callback_example.py](examples/callback_example.py) for
+the receiving end of the callback. The end-to-end flow is also
+captured in the SyntetiQ stack diagram earlier in this README and in
+[`syntetiqdaas/README.md`](https://github.com/syntetiq/syntetiqdaas/blob/main/README.md#integration--isaacsimapp-synthetic-data-generator).
+
 ## Output formats
 
 | Format     | Layout                                                                            | Converter                                                                              |
@@ -334,4 +445,3 @@ Selected via `dataset_format` (REST request body); default is `yolo`. Zipping is
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
-
